@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
-  import { invoke } from '$lib/bridge';
+  import { invoke, isElectron } from '$lib/bridge';
   import type { RenderEngine } from '../renderer/engine';
   import { settings } from '../stores/settings';
 
@@ -78,10 +78,24 @@
     return { experimentalWebRTC: webrtc, experimentalZeroCopy: zeroCopy };
   }
 
+  // Browser (non-Electron) builds have no display enumeration or window
+  // placement IPC. Size the popup from window.screen instead and keep the
+  // proxy so close/status can act on it directly.
+  let browserPopup: Window | null = null;
+
+  function browserPopupBounds() {
+    const scr = window.screen as Screen & { availLeft?: number; availTop?: number };
+    const winW = Math.min(1280, scr.availWidth);
+    const winH = Math.min(720, scr.availHeight);
+    const x = (scr.availLeft ?? 0) + Math.round((scr.availWidth - winW) / 2);
+    const y = (scr.availTop ?? 0) + Math.round((scr.availHeight - winH) / 2);
+    return { winW, winH, x, y };
+  }
+
   // Open output window — opens a draggable window (double-click to fullscreen)
   export async function openPopup(preferExternal: boolean = true) {
     const { experimentalWebRTC, experimentalZeroCopy } = readExperimentalTransports();
-    if (experimentalZeroCopy) {
+    if (experimentalZeroCopy || !isElectron) {
       return openPopupZeroCopy(preferExternal);
     }
     const transportTag = experimentalWebRTC ? ' [WebRTC]' : '';
@@ -153,27 +167,34 @@
   //      establishes the local MessageChannel from there.
   async function openPopupZeroCopy(preferExternal: boolean) {
     try {
-      const displays: any[] = await invoke('get_displays');
-      let target = displays[0];
-      if (preferExternal) {
-        const external = displays.find((d: any) => !(d.isPrimary ?? d.primary));
-        if (external) target = external;
-      }
-      const bounds = target.bounds || target;
-      const winW = Math.min(1280, bounds.width);
-      const winH = Math.min(720, bounds.height);
-      const x = bounds.x + Math.round((bounds.width - winW) / 2);
-      const y = bounds.y + Math.round((bounds.height - winH) / 2);
+      let winW: number, winH: number, x: number, y: number;
+      let targetLabel = 'browser screen';
+      if (isElectron) {
+        const displays: any[] = await invoke('get_displays');
+        let target = displays[0];
+        if (preferExternal) {
+          const external = displays.find((d: any) => !(d.isPrimary ?? d.primary));
+          if (external) target = external;
+        }
+        const bounds = target.bounds || target;
+        winW = Math.min(1280, bounds.width);
+        winH = Math.min(720, bounds.height);
+        x = bounds.x + Math.round((bounds.width - winW) / 2);
+        y = bounds.y + Math.round((bounds.height - winH) / 2);
+        targetLabel = target.label;
 
-      // 1) Pre-stage placement config so setWindowOpenHandler knows
-      // where to put the new BrowserWindow.
-      await invoke('configure_next_output_window', {
-        displayId: target.id,
-        width: winW,
-        height: winH,
-        x, y,
-        fullscreen: false,
-      });
+        // 1) Pre-stage placement config so setWindowOpenHandler knows
+        // where to put the new BrowserWindow.
+        await invoke('configure_next_output_window', {
+          displayId: target.id,
+          width: winW,
+          height: winH,
+          x, y,
+          fullscreen: false,
+        });
+      } else {
+        ({ winW, winH, x, y } = browserPopupBounds());
+      }
 
       // 2) Open the window via the renderer. URL is the current
       // origin + ?mode=webgpu-display, which Vite serves for dev and
@@ -186,11 +207,14 @@
       const features = `popup=true,width=${winW},height=${winH},left=${x},top=${y}`;
       const newWin = window.open(url.toString(), 'ga-output', features);
       if (!newWin) {
-        alert('Output window failed to open. Check Chromium popup-blocker behaviour.');
+        alert(isElectron
+          ? 'Output window failed to open. Check Chromium popup-blocker behaviour.'
+          : 'Output window was blocked. Allow pop-ups for this site and try again.');
         return;
       }
+      browserPopup = isElectron ? null : newWin;
       isOpen = true;
-      console.log(`[Output] Window opened on display "${target.label}" (${winW}x${winH}) [WebGPU zero-copy]`);
+      console.log(`[Output] Window opened on display "${targetLabel}" (${winW}x${winH}) [WebGPU zero-copy]`);
 
       // 3) Tell the presenter to attach to this window. The presenter
       // already has the editor canvas (registerEditorCanvas was called
@@ -209,6 +233,12 @@
   // systems this is intentionally a no-op; the separate Output Window
   // button is the local preview path.
   export async function openFullscreenExternal() {
+    if (!isElectron) {
+      // Browsers can't target a specific display. Open the output popup;
+      // drag it to the projector and double-click it to go fullscreen.
+      await openPopupZeroCopy(true);
+      return isOpen;
+    }
     const { experimentalWebRTC, experimentalZeroCopy } = readExperimentalTransports();
     if (experimentalZeroCopy) {
       // Reuse the openPopup zero-copy path with a fullscreen flag.
@@ -261,6 +291,12 @@
 
   // Toggle fullscreen on existing output window
   export async function toggleFullscreen() {
+    if (!isElectron) {
+      // Fullscreen needs a user gesture inside the output window itself
+      // (double-click it), so there's nothing to do from the editor.
+      browserPopup?.focus();
+      return false;
+    }
     try {
       return await invoke('output_toggle_fullscreen');
     } catch (error) {
@@ -270,6 +306,12 @@
   }
 
   export async function getStatus(): Promise<{ exists: boolean; fullScreen: boolean; isExternal: boolean } | null> {
+    if (!isElectron) {
+      const exists = !!browserPopup && !browserPopup.closed;
+      let fullScreen = false;
+      try { fullScreen = !!browserPopup?.document.fullscreenElement; } catch { /* */ }
+      return { exists, fullScreen, isExternal: false };
+    }
     try {
       return await invoke('output_window_status');
     } catch (error) {
@@ -286,7 +328,15 @@
   }
 
   export function close() {
-    invoke('close_output_window').catch(() => {});
+    if (isElectron) {
+      invoke('close_output_window').catch(() => {});
+    } else if (browserPopup) {
+      import('$lib/sync/outputSharedTexturePresenter')
+        .then(({ detachOutputWindow }) => detachOutputWindow())
+        .catch(() => {});
+      try { browserPopup.close(); } catch { /* */ }
+      browserPopup = null;
+    }
     isOpen = false;
     onClose();
   }

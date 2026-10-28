@@ -47,7 +47,7 @@
    * Toggleable at runtime by pressing `S`.
    */
   import { onMount, onDestroy } from 'svelte';
-  import { invoke } from '$lib/bridge';
+  import { invoke, isElectron } from '$lib/bridge';
 
   const urlParams = new URLSearchParams(window.location.search);
   let showStats = urlParams.get('stats') === '1';
@@ -634,7 +634,24 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     }
   }
 
+  // Browser builds: the window manager owns fullscreen, so use the DOM
+  // Fullscreen API. Double-click is the user gesture it requires.
+  function handleDoubleClick(): void {
+    if (isElectron) return;
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+    } else {
+      document.documentElement.requestFullscreen().catch((err: any) => {
+        console.warn('[OutputSharedTexture] requestFullscreen failed:', err);
+      });
+    }
+  }
+
   function exitOutputFullscreen(): void {
+    if (!isElectron) {
+      if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+      return;
+    }
     invoke('output_exit_fullscreen').catch((err: any) => {
       console.warn('[OutputSharedTexture] Failed to exit fullscreen:', err);
     });
@@ -656,6 +673,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     }
 
     window.addEventListener('keydown', handleKeydown);
+    window.addEventListener('dblclick', handleDoubleClick);
 
     await initWebGPU();
 
@@ -676,6 +694,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   onDestroy(() => {
     disposed = true;
     window.removeEventListener('keydown', handleKeydown);
+    window.removeEventListener('dblclick', handleDoubleClick);
     window.removeEventListener('message', handlePortIntake);
     if (attachedPort) {
       try { attachedPort.close(); } catch { /* */ }

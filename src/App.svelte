@@ -3823,6 +3823,9 @@
       outputWindow.openPopup();
       outputIsOpen = true;
       settings.setOutputWindowOpen(true);
+      if (!isDesktopApp) {
+        showToast('Drag the output window to your projector, then double-click it for fullscreen.', 'info');
+      }
     }
   }
 
@@ -3897,6 +3900,9 @@
     outputIsOpen = true;
     outputMode = 'fullscreen';
     settings.setOutputWindowOpen(true);
+    if (!isDesktopApp) {
+      showToast('Drag the output window to your projector, then double-click it for fullscreen.', 'info');
+    }
   }
 
   // Show mobile connection info
